@@ -115,7 +115,7 @@ public class MediaAge {
     }
 
     private LocalDateTime findImageExifDate(Path path) throws ImageProcessingException, IOException {
-        List<Date> imageDates = new ArrayList();
+        List<Date> imageDates = new ArrayList<>();
         Metadata metadata = ImageMetadataReader.readMetadata(path.toFile());
 
         Collection< ExifDirectoryBase> exifDirectoryBases = metadata.getDirectoriesOfType(ExifDirectoryBase.class);
