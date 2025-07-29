@@ -9,8 +9,12 @@ import com.drew.metadata.exif.ExifImageDirectory;
 import com.drew.metadata.exif.ExifSubIFDDirectory;
 import com.drew.metadata.file.FileSystemDirectory;
 import com.drew.metadata.mp4.Mp4Directory;
+import com.drew.metadata.mp4.media.Mp4MediaDirectory;
 import com.drew.metadata.png.PngDirectory;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -19,13 +23,17 @@ import java.nio.file.attribute.FileTime;
 import java.time.LocalDateTime;
 import java.time.Month;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
+import java.util.Objects;
 import java.util.TimeZone;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class MediaAge {
@@ -83,11 +91,11 @@ public class MediaAge {
                     System.out.println(path + " -> " + fileTime.toString());
                 }
             } else {
-                System.out.println("no exif date for " + path);
+                System.out.println("no date for " + path);
             }
 
         } catch (IOException | ImageProcessingException ex) {
-            System.getLogger(MediaAge.class.getName()).log(System.Logger.Level.ERROR, (String) null, ex);
+            ex.printStackTrace();
         }
     }
 
@@ -95,7 +103,7 @@ public class MediaAge {
         if (isImage(path)) {
             return findImageExifDate(path);
         }
-        if (isMp4(path)) {
+        if (isVideo(path)) {
             return findVideoAge(path);
         }
         return null;
@@ -103,10 +111,12 @@ public class MediaAge {
 
     private boolean isImage(Path path) throws IOException {
         String mimeType = Files.probeContentType(path);
-        if (mimeType != null && mimeType.startsWith("image/")) {
-            return true;
-        }
-        return false;
+        return mimeType != null && mimeType.startsWith("image/");
+    }
+
+    private boolean isVideo(Path path) throws IOException {
+        String mimeType = Files.probeContentType(path);
+        return mimeType != null && mimeType.startsWith("video/");
     }
 
     private boolean isMp4(Path path) throws IOException {
@@ -186,30 +196,108 @@ public class MediaAge {
     }
 
     private LocalDateTime findVideoAge(Path path) throws ImageProcessingException, IOException {
-        if (isMp4(path)) {
-            return findMp4VideoAge(path);
-        }
-        return null;
-    }
-
-    private LocalDateTime findMp4VideoAge(Path path) throws ImageProcessingException, IOException {
         List<LocalDateTime> dates = new ArrayList<>();
-        Metadata metadata = ImageMetadataReader.readMetadata(path.toFile());
-        Collection<Mp4Directory> mp4Directories = metadata.getDirectoriesOfType(Mp4Directory.class);
-        for (Mp4Directory mp4Directory : mp4Directories) {
-            Date dateTime = mp4Directory.getDate(Mp4Directory.TAG_CREATION_TIME, TimeZone.getTimeZone(ZoneId.systemDefault()));
-            if (dateTime != null) {
-                LocalDateTime createTime = LocalDateTime.ofInstant(dateTime.toInstant(), ZoneId.systemDefault());
-                boolean isFirstFirst1970 = createTime.getYear() == 1970 && createTime.getMonth() == Month.JANUARY && createTime.getDayOfMonth() == 1;
-                boolean isFistFirst1904 = createTime.getYear() == 1904 && createTime.getMonth() == Month.JANUARY && createTime.getDayOfMonth() == 1;
-                if (!isFirstFirst1970 && !isFistFirst1904) {
-                    dates.add(truncate(createTime));
-                }
-            }
+        if (isMp4(path)) {
+            dates.addAll(findMp4VideoAge(path));
         }
+
+        dates.addAll(findVideoDatesWithFFProbe(path));
+
+        dates.addAll(findVideoFromFileName(path));
+
         return dates.stream()
+                .filter(date -> isValidDate(date))
                 .min(LocalDateTime::compareTo)
                 .orElse(null);
+
+    }
+
+    private List<LocalDateTime> findMp4VideoAge(Path path) {
+        List<LocalDateTime> dates = new ArrayList<>();
+        try {
+            Metadata metadata = ImageMetadataReader.readMetadata(path.toFile());
+
+            Collection<Mp4Directory> mp4Directories = metadata.getDirectoriesOfType(Mp4Directory.class);
+            for (Mp4Directory mp4Directory : mp4Directories) {
+                Date mp4CreateTime = mp4Directory.getDate(Mp4MediaDirectory.TAG_CREATION_TIME, TimeZone.getTimeZone(ZoneId.systemDefault()));
+                if (mp4CreateTime != null) {
+                    LocalDateTime createTime = LocalDateTime.ofInstant(mp4CreateTime.toInstant(), ZoneId.systemDefault());
+                    if (isValidDate(createTime)) {
+                        dates.add(truncate(createTime));
+                    }
+                }
+
+                Date dateTime = mp4Directory.getDate(Mp4Directory.TAG_CREATION_TIME, TimeZone.getTimeZone(ZoneId.systemDefault()));
+                if (dateTime != null) {
+                    LocalDateTime createTime = LocalDateTime.ofInstant(dateTime.toInstant(), ZoneId.systemDefault());
+                    if (isValidDate(createTime)) {
+                        dates.add(truncate(createTime));
+                    }
+                }
+            }
+        } catch (ImageProcessingException | IOException ignore) {
+        }
+        return dates;
+    }
+
+    private List<LocalDateTime> findVideoDatesWithFFProbe(Path path) throws IOException {
+        ProcessBuilder pb = new ProcessBuilder("ffprobe", "-v", "quiet", "-print_format", "flat", "-show_format", path.toString());
+        Process process = pb.start();
+        try (InputStream is = process.getInputStream()) {
+
+            return new BufferedReader(new InputStreamReader(is))
+                    .lines()
+                    .filter(line -> line.contains("format.tags.date") || line.contains("format.tags.creation_time"))
+                    .map(line -> {
+                        String lastPart = line.substring(line.indexOf("\"") + 1, line.length() - 1);
+                        try {
+                            return LocalDateTime.parse(lastPart, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSSX"));
+                        } catch (DateTimeParseException ignore) {
+                        }
+                        try {
+                            return LocalDateTime.parse(lastPart, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                        } catch (DateTimeParseException ignore) {
+                        }
+                        try {
+                            return LocalDateTime.parse(lastPart, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+                        } catch (DateTimeParseException ignore) {
+                        }
+                        try {
+                            return LocalDateTime.parse(lastPart, DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+                        } catch (DateTimeParseException ignore) {
+                        }
+                        try {
+                            return LocalDateTime.parse(lastPart, DateTimeFormatter.ISO_ZONED_DATE_TIME);
+                        } catch (DateTimeParseException ignore) {
+                        }
+                        return null;
+                    })
+                    .filter(Objects::nonNull)
+                    .filter(localDate -> isValidDate(localDate))
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private List<LocalDateTime> findVideoFromFileName(Path path) {
+        List<LocalDateTime> dates = new ArrayList<>();
+        try {
+            String fileName = path.getFileName().toString();
+            fileName = fileName.replaceFirst(".*([0-9]{8}_[0-9]{6}).*", "$1");
+
+            dates.add(LocalDateTime.parse(fileName, DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss")));
+        } catch (Exception ignore) {
+        }
+
+        return dates;
+    }
+
+    private boolean isValidDate(LocalDateTime localDate) {
+        if (localDate != null) {
+            boolean isFirstFirst1970 = localDate.getYear() == 1970 && localDate.getMonth() == Month.JANUARY && localDate.getDayOfMonth() == 1;
+            boolean isFistFirst1904 = localDate.getYear() == 1904 && localDate.getMonth() == Month.JANUARY && localDate.getDayOfMonth() == 1;
+            return !isFirstFirst1970 && !isFistFirst1904;
+        }
+        return false;
     }
 
     private LocalDateTime getFileLastModification(Path path) throws IOException {
